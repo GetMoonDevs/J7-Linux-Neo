@@ -1,0 +1,293 @@
+name: Build Linux boot test for Galaxy J7 Neo (kernel + dtb + startup.nsh)
+
+# Save as .github/workflows/build-j7neo-linux.yml, then Actions -> Run workflow.
+# Output artifact "j7neo-linux-test" contains:
+#   linux.efi      kernel (EFI stub) with a tiny initramfs embedded
+#   j7velte.dtb    minimal device tree for the J7 Neo (Exynos 7870)
+#   startup.nsh    UEFI Shell script that launches the kernel automatically
+#   deploy.ps1     PowerShell script that copies the files to the phone's cache partition
+#   README.txt
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Kernel version, e.g. 6.18.2 (leave empty = newest longterm >= 6.16)"
+        default: ""
+      dt_framebuffer:
+        description: "Also add a simple-framebuffer node to the device tree (use only if the screen stays black)"
+        type: boolean
+        default: false
+      fb_address:
+        description: "Framebuffer address for the optional node (from Mu-Silicium MemoryMapLib: Display Reserved)"
+        default: "0x67000000"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu build-essential bc bison flex \
+            libssl-dev libelf-dev xz-utils curl python3 git cpio
+          mkdir -p logs out
+
+      - name: Log what Mu-Silicium says about framebuffer / RAM (info only)
+        run: |
+          git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git ms
+          {
+            echo "=== Mu-Silicium commit: $(git -C ms rev-parse HEAD)"
+            echo "=== FrameBuffer / SystemMemory PCDs in Exynos 7870 + gtaxllte files ==="
+            grep -rniE 'FrameBuffer|SystemMemory|Display' \
+              ms/Platforms/Samsung/gtaxlltePkg ms/Platforms/Samsung/S5E7870Pkg \
+              ms/Silicon/Samsung/S5E7870Pkg 2>/dev/null || echo "(nothing found)"
+          } | tee logs/mu-silicium-fb-info.txt
+
+      - name: Pick kernel version
+        id: kver
+        env:
+          WANT: ${{ inputs.kernel_version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+
+          want = os.environ.get("WANT", "").strip()
+          if want:
+              major = want.split(".")[0]
+              url = f"https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{want}.tar.xz"
+              ver = want
+          else:
+              data = json.load(urllib.request.urlopen("https://www.kernel.org/releases.json"))
+              def tup(v): return tuple(int(x) for x in re.findall(r"\d+", v.split("-rc")[0]))
+              rel = [r for r in data["releases"] if r["moniker"] in ("longterm", "stable")]
+              lts = [r for r in rel if r["moniker"] == "longterm" and tup(r["version"]) >= (6, 16)]
+              pool = lts or rel
+              best = max(pool, key=lambda r: tup(r["version"]))
+              ver, url = best["version"], best["source"]
+          print("kernel:", ver, url)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={ver}\nurl={url}\n")
+          PY
+
+      - name: Build static aarch64 busybox
+        run: |
+          curl -fsSL -o bb.tar.bz2 https://busybox.net/downloads/busybox-1.37.0.tar.bz2 \
+            || curl -fsSL -o bb.tar.bz2 https://github.com/mirror/busybox/archive/refs/tags/1_37_0.tar.gz
+          mkdir bb && tar -xf bb.tar.bz2 -C bb --strip-components=1
+          cd bb
+          make defconfig
+          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          make -j"$(nproc)" CROSS_COMPILE=aarch64-linux-gnu- busybox 2>&1 | tee ../logs/busybox.log | tail -n 5
+          file busybox
+          cp busybox ../out/busybox
+
+      - name: Create initramfs file list and init script
+        run: |
+          cat > init.sh <<'EOF'
+          #!/bin/busybox sh
+          /bin/busybox --install -s /bin
+          mount -t proc proc /proc
+          mount -t sysfs sys /sys
+          mount -t devtmpfs dev /dev
+          clear
+          echo "########################################"
+          echo "#   LINUX IS RUNNING ON GALAXY J7 NEO  #"
+          echo "########################################"
+          echo
+          uname -a
+          echo
+          grep -m4 -iE 'processor|CPU part|CPU implementer|Hardware' /proc/cpuinfo
+          echo
+          free -m
+          echo
+          echo "--- /proc/partitions (eMMC visible if listed) ---"
+          cat /proc/partitions
+          echo
+          echo "--- last kernel messages ---"
+          dmesg | tail -n 25
+          echo
+          i=0
+          while true; do
+            echo "alive: $i s"
+            i=$((i+1))
+            sleep 1
+          done
+          EOF
+          cat > initramfs.list <<EOF
+          dir /bin 0755 0 0
+          dir /dev 0755 0 0
+          dir /proc 0755 0 0
+          dir /sys 0755 0 0
+          dir /tmp 0755 0 0
+          nod /dev/console 0600 0 0 c 5 1
+          nod /dev/null 0666 0 0 c 1 3
+          file /bin/busybox $PWD/out/busybox 0755 0 0
+          slink /bin/sh busybox 0777 0 0
+          file /init $PWD/init.sh 0755 0 0
+          EOF
+          cat initramfs.list
+
+      - name: Download kernel source
+        run: |
+          curl -fsSL -o linux.tar.xz "${{ steps.kver.outputs.url }}"
+          mkdir linux && tar -xf linux.tar.xz -C linux --strip-components=1
+          test -f linux/arch/arm64/boot/dts/exynos/exynos7870.dtsi \
+            || { echo "::error::This kernel has no exynos7870.dtsi. Pick a newer version via the kernel_version input."; exit 1; }
+
+      - name: Add J7 Neo device tree
+        working-directory: linux
+        env:
+          FB_NODE: ${{ inputs.dt_framebuffer }}
+          FB_ADDR: ${{ inputs.fb_address }}
+        run: |
+          D=arch/arm64/boot/dts/exynos
+          cat > $D/exynos7870-j7velte.dts <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * Samsung Galaxy J7 Neo (j7velte) - minimal boot-test device tree
+           */
+          /dts-v1/;
+          #include "exynos7870.dtsi"
+
+          / {
+                  model = "Samsung Galaxy J7 Neo";
+                  compatible = "samsung,j7velte", "samsung,exynos7870";
+                  chassis-type = "handset";
+
+                  /* The real RAM layout comes from the UEFI memory map, not from here. */
+                  memory@40000000 {
+                          device_type = "memory";
+                          reg = <0x0 0x40000000 0x0 0x3e400000>,
+                                <0x0 0x80000000 0x0 0x40000000>;
+                  };
+
+                  chosen {
+                          bootargs = "console=tty0 earlycon=efifb keep_bootcon clk_ignore_unused pd_ignore_unused rdinit=/init";
+                          #address-cells = <2>;
+                          #size-cells = <2>;
+                          ranges;
+                  };
+          };
+          EOF
+          if [ "$FB_NODE" = "true" ]; then
+            python3 - "$D/exynos7870-j7velte.dts" "$FB_ADDR" <<'PY'
+          import sys
+          p, addr = sys.argv[1], int(sys.argv[2], 16)
+          s = open(p).read()
+          node = f"""
+                          framebuffer@{addr:x} {{
+                                  compatible = "simple-framebuffer";
+                                  reg = <0x0 0x{addr:x} 0x0 0x384000>;
+                                  width = <720>;
+                                  height = <1280>;
+                                  stride = <2880>;
+                                  format = "a8r8g8b8";
+                          }};
+          """
+          import re
+          s, n = re.subn(r"^([ \t]*)ranges;\n", lambda m: m.group(0) + node, s, count=1, flags=re.M)
+          if n != 1:
+              raise SystemExit("could not insert framebuffer node")
+          open(p, "w").write(s)
+          PY
+          fi
+          echo 'dtb-$(CONFIG_ARCH_EXYNOS) += exynos7870-j7velte.dtb' >> $D/Makefile
+          cat $D/exynos7870-j7velte.dts
+
+      - name: Configure kernel
+        working-directory: linux
+        run: |
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+          S=scripts/config
+          # no modules: everything we need is built in
+          $S --disable MODULES
+          $S --disable DEBUG_INFO_BTF --disable DEBUG_INFO --disable DEBUG_INFO_DWARF5 --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          # EFI boot + framebuffer console
+          $S --enable EFI --enable EFI_STUB --enable EFI_EARLYCON --enable EFI_ARMSTUB_DTB_LOADER
+          $S --enable SYSFB_SIMPLEFB --enable FB --enable FB_EFI --enable FB_SIMPLE
+          $S --enable DRM --enable DRM_SIMPLEDRM --enable DRM_FBDEV_EMULATION
+          $S --enable VT --enable VT_CONSOLE --enable FRAMEBUFFER_CONSOLE
+          $S --enable FONTS --enable FONT_TER16x32
+          # initramfs embedded in the kernel image
+          $S --enable BLK_DEV_INITRD --enable DEVTMPFS --enable TMPFS --enable PROC_FS --enable SYSFS
+          $S --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/initramfs.list"
+          # eMMC (to see if Linux can see the internal storage)
+          $S --enable MMC --enable MMC_BLOCK --enable MMC_DW --enable MMC_DW_EXYNOS
+          # keep the kernel small, the UEFI only exposes little free RAM
+          $S --disable KVM --disable DRM_AMDGPU --disable DRM_NOUVEAU
+          make olddefconfig
+          grep -E 'CONFIG_(MODULES|EFI_STUB|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|MMC_DW_EXYNOS|ARCH_EXYNOS|INITRAMFS_SOURCE)[= ]' .config
+
+      - name: Build kernel and dtb
+        working-directory: linux
+        run: |
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make -j"$(nproc)" Image exynos/exynos7870-j7velte.dtb 2>&1 | tee ../logs/kernel.log | tail -n 20
+          ls -l arch/arm64/boot/Image arch/arm64/boot/dts/exynos/exynos7870-j7velte.dtb
+          SIZE=$(stat -c %s arch/arm64/boot/Image)
+          echo "Image size: $((SIZE/1024/1024)) MB"
+          if [ "$SIZE" -gt 62914560 ]; then
+            echo "::warning::Image is over 60 MB. The UEFI exposes little free RAM, so it may fail to load."
+          fi
+          cp arch/arm64/boot/Image ../out/linux.efi
+          cp arch/arm64/boot/dts/exynos/exynos7870-j7velte.dtb ../out/j7velte.dtb
+
+      - name: Create startup.nsh, deploy.ps1 and README
+        run: |
+          # UEFI shell script (ASCII, CRLF). Looks for linux.efi on fs0..fs7.
+          {
+            printf 'echo Looking for Linux...\r\n'
+            printf 'for %%a run (0 7)\r\n'
+            printf '  if exist fs%%a:\\linux.efi then\r\n'
+            printf '    fs%%a:\r\n'
+            printf '    echo Launching Linux from fs%%a:\r\n'
+            printf '    stall 3000000\r\n'
+            printf '    linux.efi dtb=j7velte.dtb console=tty0 earlycon=efifb keep_bootcon loglevel=8 clk_ignore_unused pd_ignore_unused fbcon=font:TER16x32 rdinit=/init\r\n'
+            printf '  endif\r\n'
+            printf 'endfor\r\n'
+            printf 'echo linux.efi not found or it returned to the shell\r\n'
+            printf 'stall 30000000\r\n'
+          } > out/startup.nsh
+
+          cat > out/deploy.ps1 <<'EOF'
+          # Run from the folder holding these files. Phone must be in recovery (TWRP) with ADB working.
+          # Writes ONLY to the FAT32 partition mmcblk0p20 (cache) that you formatted earlier.
+          $ErrorActionPreference = "Stop"
+          adb shell "mkdir -p /mnt/esp; umount /mnt/esp 2>/dev/null; mount -t vfat /dev/block/mmcblk0p20 /mnt/esp"
+          adb push linux.efi   /mnt/esp/linux.efi
+          adb push j7velte.dtb /mnt/esp/j7velte.dtb
+          adb push startup.nsh /mnt/esp/startup.nsh
+          adb shell "ls -l /mnt/esp; umount /mnt/esp; sync"
+          Write-Host "Done. Run: adb reboot   then pick Internal Storage in the UEFI menu."
+          EOF
+
+          cat > out/README.txt <<'EOF'
+          1. Unzip the artifact on Windows.
+          2. Put the phone in recovery, check "adb devices".
+          3. In PowerShell, in the unzipped folder:  powershell -ExecutionPolicy Bypass -File .\deploy.ps1
+          4. adb reboot, in the UEFI menu pick Internal Storage. The shell starts, startup.nsh
+             waits 5 seconds, then launches the kernel.
+          Expected: a message "LINUX IS RUNNING ON GALAXY J7 NEO" and an "alive: N s" counter.
+          Take a video if it fails and note the LAST thing shown on screen.
+          EOF
+          rm -f out/busybox
+          ls -la out
+
+      - name: Upload test files
+        uses: actions/upload-artifact@v4
+        with:
+          name: j7neo-linux-test
+          path: out/*
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: logs/*
+          if-no-files-found: warn
