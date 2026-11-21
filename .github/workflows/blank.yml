@@ -208,8 +208,9 @@ jobs:
           export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           make defconfig
           S=scripts/config
-          # no modules: everything we need is built in
-          $S --disable MODULES
+          # Keep MODULES on. With MODULES off, every "=m" driver in defconfig becomes built-in
+          # and the Image grows to ~86 MB, which does not fit in the ~84 MB the UEFI exposes.
+          # We only build the Image (not the modules), so the =m drivers are simply left out.
           $S --disable DEBUG_INFO_BTF --disable DEBUG_INFO --disable DEBUG_INFO_DWARF5 --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
           # EFI boot + framebuffer console
           $S --enable EFI --enable EFI_STUB --enable EFI_EARLYCON --enable EFI_ARMSTUB_DTB_LOADER
@@ -236,8 +237,11 @@ jobs:
           ls -l arch/arm64/boot/Image arch/arm64/boot/dts/exynos/exynos7870-j7velte.dtb
           SIZE=$(stat -c %s arch/arm64/boot/Image)
           echo "Image size: $((SIZE/1024/1024)) MB"
-          if [ "$SIZE" -gt 62914560 ]; then
-            echo "::warning::Image is over 60 MB. The UEFI exposes little free RAM, so it may fail to load."
+          if [ "$SIZE" -gt 78643200 ]; then
+            echo "::error::Image is over 75 MB but the UEFI only exposes ~84 MB of free RAM. It cannot load."
+            exit 1
+          elif [ "$SIZE" -gt 52428800 ]; then
+            echo "::warning::Image is over 50 MB. The UEFI exposes little free RAM, so it may fail to load."
           fi
           cp arch/arm64/boot/Image ../out/linux.efi
           cp arch/arm64/boot/dts/exynos/exynos7870-j7velte.dtb ../out/j7velte.dtb
