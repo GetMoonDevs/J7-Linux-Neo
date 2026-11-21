@@ -80,7 +80,12 @@ jobs:
           make defconfig
           sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
           sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
-          make -j"$(nproc)" CROSS_COMPILE=aarch64-linux-gnu- busybox 2>&1 | tee ../logs/busybox.log | tail -n 5
+          # x86-only SHA acceleration breaks the aarch64 cross build (sha1_process_block64_shaNI)
+          sed -i 's/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' .config
+          sed -i 's/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' .config
+          grep -E 'HWACCEL|CONFIG_STATIC|CONFIG_TC' .config
+          set -o pipefail
+          make -j"$(nproc)" CROSS_COMPILE=aarch64-linux-gnu- busybox 2>&1 | tee ../logs/busybox.log | tail -n 15
           file busybox
           cp busybox ../out/busybox
 
@@ -225,6 +230,7 @@ jobs:
       - name: Build kernel and dtb
         working-directory: linux
         run: |
+          set -o pipefail
           export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           make -j"$(nproc)" Image exynos/exynos7870-j7velte.dtb 2>&1 | tee ../logs/kernel.log | tail -n 20
           ls -l arch/arm64/boot/Image arch/arm64/boot/dts/exynos/exynos7870-j7velte.dtb
