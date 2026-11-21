@@ -114,11 +114,33 @@ jobs:
           echo "--- last kernel messages ---"
           dmesg | tail -n 25
           echo
+          echo "--- saving full log to the cache partition (read it later with getlog.ps1) ---"
+          n=0
+          while [ ! -b /dev/mmcblk0p20 ] && [ $n -lt 20 ]; do sleep 1; n=$((n+1)); done
+          mkdir -p /mnt
+          if mount -t vfat /dev/mmcblk0p20 /mnt 2>/tmp/mounterr; then
+            {
+              echo "=== uname ==="; uname -a
+              echo "=== cpuinfo ==="; cat /proc/cpuinfo
+              echo "=== meminfo ==="; cat /proc/meminfo
+              echo "=== partitions ==="; cat /proc/partitions
+              echo "=== block devices ==="; ls -l /dev
+              echo "=== iomem ==="; cat /proc/iomem
+              echo "=== dmesg ==="; dmesg
+            } > /mnt/linux-log.txt 2>&1
+            sync
+            umount /mnt
+            echo "LOG SAVED to cache partition: linux-log.txt"
+          else
+            echo "COULD NOT SAVE LOG: $(cat /tmp/mounterr)"
+            ls -l /dev | grep -i mmc
+          fi
+          echo
           i=0
           while true; do
             echo "alive: $i s"
-            i=$((i+1))
-            sleep 1
+            i=$((i+10))
+            sleep 10
           done
           EOF
           cat > initramfs.list <<EOF
@@ -127,6 +149,7 @@ jobs:
           dir /proc 0755 0 0
           dir /sys 0755 0 0
           dir /tmp 0755 0 0
+          dir /mnt 0755 0 0
           nod /dev/console 0600 0 0 c 5 1
           nod /dev/null 0666 0 0 c 1 3
           file /bin/busybox $PWD/out/busybox 0755 0 0
@@ -223,6 +246,9 @@ jobs:
           $S --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/initramfs.list"
           # eMMC (to see if Linux can see the internal storage)
           $S --enable MMC --enable MMC_BLOCK --enable MMC_DW --enable MMC_DW_EXYNOS
+          # FAT so the init script can write a log file to the cache partition
+          $S --enable FAT_FS --enable VFAT_FS --enable NLS --enable NLS_CODEPAGE_437 --enable NLS_ISO8859_1
+          $S --set-str NLS_DEFAULT iso8859-1
           # keep the kernel small, the UEFI only exposes little free RAM
           $S --disable KVM --disable DRM_AMDGPU --disable DRM_NOUVEAU
           make olddefconfig
@@ -282,7 +308,16 @@ jobs:
           4. adb reboot, in the UEFI menu pick Internal Storage. The shell starts, startup.nsh
              waits 5 seconds, then launches the kernel.
           Expected: a message "LINUX IS RUNNING ON GALAXY J7 NEO" and an "alive: N s" counter.
+          If the screen shows LOG SAVED, boot into recovery and run getlog.ps1 to get linux-log.txt.
           Take a video if it fails and note the LAST thing shown on screen.
+          EOF
+          cat > out/getlog.ps1 <<'EOF'
+          # Phone in recovery with ADB working. Copies the log Linux wrote to the cache partition.
+          $ErrorActionPreference = "Stop"
+          adb shell "mkdir -p /mnt/esp; umount /mnt/esp 2>/dev/null; mount -t vfat /dev/block/mmcblk0p20 /mnt/esp"
+          adb pull /mnt/esp/linux-log.txt linux-log.txt
+          adb shell "umount /mnt/esp; sync"
+          Write-Host "Saved linux-log.txt here. Open it, or send it to Claude."
           EOF
           rm -f out/busybox
           ls -la out
